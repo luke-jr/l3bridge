@@ -5,6 +5,7 @@
 #include <stdlib.h>
 
 #include <arpa/inet.h>
+#include <sys/ioctl.h>
 #include <net/if.h>
 #include <net/if_arp.h>
 #include <sys/types.h>
@@ -175,6 +176,82 @@ enum l3p_nonether {
 };
 
 static
+void route_l2_ether(const struct routing_entry * const re, const enum protocol proto, const uint8_t * const buf, const size_t bufsz)
+{
+	if (strlen(re->ifcfg->ifname) >= IFNAMSIZ)
+	{
+		fprintf(stderr, "Interface name '%s' too long!\n", re->ifcfg->ifname);
+		return;
+	}
+	
+	uint16_t nextproto;
+	switch (proto)
+	{
+		case LBP_IPV6:
+			nextproto = ETH_P_IPV6;
+			break;
+		default:
+			fprintf(stderr, "Don't know how to put %s inside Ethernet\n", protocol_info[proto].name);
+	}
+	
+	struct ifreq ifr;
+	strcpy(ifr.ifr_name, re->ifcfg->ifname);
+	if (ioctl(ps, SIOCGIFHWADDR, &ifr) == -1 || ifr.ifr_hwaddr.sa_family != ARPHRD_ETHER)
+	{
+		fprintf(stderr, "Error getting MAC address for '%s'\n", re->ifcfg->ifname);
+		return;
+	}
+	
+	nextproto = htons(nextproto);
+	
+	uint8_t fullpkt[14 + bufsz];
+	memcpy(&fullpkt[  0], re->xdata, 6);
+	memcpy(&fullpkt[  6], ifr.ifr_hwaddr.sa_data, 6);
+	memcpy(&fullpkt[0xc], &nextproto, 2);
+	memcpy(&fullpkt[0xe], buf, bufsz);
+	
+	struct sockaddr_ll sa;
+	sa.sll_family = AF_PACKET;
+	sa.sll_ifindex = if_nametoindex(re->ifcfg->ifname);
+	if (!sa.sll_ifindex)
+	{
+		fprintf(stderr, "Error finding outgoing interface '%s'\n", re->ifcfg->ifname);
+		return;
+	}
+	sa.sll_halen = 6;
+	memcpy(sa.sll_addr, re->xdata, 6);
+	
+	if (sendto(ps, fullpkt, sizeof(fullpkt), 0, (void*)&sa, sizeof(sa)) != sizeof(fullpkt))
+		fprintf(stderr, "Error sending packet on '%s'\n", re->ifcfg->ifname);
+}
+
+static
+void route_out(const enum protocol proto, const void * const destaddr, const uint8_t * const buf, const size_t bufsz)
+{
+	const struct routing_entry * const re = get_route(proto, destaddr);
+	if (!re)
+	{
+		char s[0x100];
+		protocol_dest_str(s, sizeof(s), proto, destaddr);
+		fprintf(stderr, "Failed to get route for %s\n", s);
+		return;
+	}
+	
+	switch (re->renhtype)
+	{
+		case LBP_ETHERNET:
+			route_l2_ether(re, proto, buf, bufsz);
+			break;
+		default:
+		{
+			char s[0x100];
+			routing_entry_str(s, sizeof(s), re);
+			fprintf(stderr, "Don't know how to route out for %s\n", s);
+		}
+	}
+}
+
+static
 void this_layer_address(struct pktinfo * const pi, enum protocol proto, const void * const srcaddr, const void * const dstaddr)
 {
 	if (pi->l2_proto != LBP_NONE)
@@ -185,8 +262,9 @@ void this_layer_address(struct pktinfo * const pi, enum protocol proto, const vo
 }
 
 static
-void l3_ipv6(struct pktinfo * const pi, const uint8_t * const buf)
+void l3_ipv6(struct pktinfo * const pi, uint8_t * const buf)
 {
+	const size_t bufsz = pi->bufsz - (buf - pi->buf);
 	if (buf[6] == 0x3a)
 	{
 		// ICMPv6
@@ -197,7 +275,6 @@ void l3_ipv6(struct pktinfo * const pi, const uint8_t * const buf)
 			{
 				const uint8_t * const v6addr = &icmpv6[8];
 #if 0
-				const size_t bufsz = pi->bufsz - (buf - pi->buf);
 				// TODO: properly implement the option
 				if (bufsz >= 0x18 && icmpv6[0x18] == 2 && icmpv6[0x19] == 1 && pi->from->sll_hatype == ARPHRD_ETHER)
 				{
@@ -216,12 +293,14 @@ void l3_ipv6(struct pktinfo * const pi, const uint8_t * const buf)
 		fprintf(stderr, "Discarding IPv6 packet reaching its hop limit\n");
 		return;
 	}
+	--buf[7];
 	
-	
+	const uint8_t * const destaddr = &buf[0x18];
+	route_out(LBP_IPV6, destaddr, buf, bufsz);
 }
 
 static
-void l3(struct pktinfo * const pi, const uint32_t l3p, const uint8_t * const buf)
+void l3(struct pktinfo * const pi, const uint32_t l3p, uint8_t * const buf)
 {
 #if 0
 	struct if_cfg *other, *tmp;
@@ -251,7 +330,7 @@ void l3(struct pktinfo * const pi, const uint32_t l3p, const uint8_t * const buf
 }
 
 static
-void l2_ether(struct pktinfo * const pi, const uint8_t * const buf)
+void l2_ether(struct pktinfo * const pi, uint8_t * const buf)
 {
 	uint32_t l3p;
 	if (!memcmp(buf, "\x01\x80\xc2\0\0\0", 6))
