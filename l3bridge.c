@@ -176,14 +176,29 @@ enum l3p_nonether {
 };
 
 static
-void route_l2_ether(const struct routing_entry * const re, const enum protocol proto, const uint8_t * const buf, const size_t bufsz)
+bool get_hwaddr(void * const buf, const size_t bufsz, const struct if_cfg * const ifcfg, const unsigned short fam)
 {
-	if (strlen(re->ifcfg->ifname) >= IFNAMSIZ)
+	if (strlen(ifcfg->ifname) >= IFNAMSIZ)
 	{
-		fprintf(stderr, "Interface name '%s' too long!\n", re->ifcfg->ifname);
-		return;
+		fprintf(stderr, "Interface name '%s' too long!\n", ifcfg->ifname);
+		return false;
 	}
 	
+	struct ifreq ifr;
+	strcpy(ifr.ifr_name, ifcfg->ifname);
+	if (ioctl(ps, SIOCGIFHWADDR, &ifr) == -1 || ifr.ifr_hwaddr.sa_family != fam)
+	{
+		fprintf(stderr, "Error getting hw address for '%s'\n", ifcfg->ifname);
+		return false;
+	}
+	
+	memcpy(buf, ifr.ifr_hwaddr.sa_data, bufsz);
+	return true;
+}
+
+static
+void route_l2_ether(const struct routing_entry * const re, const enum protocol proto, const uint8_t * const buf, const size_t bufsz)
+{
 	uint16_t nextproto;
 	switch (proto)
 	{
@@ -194,19 +209,12 @@ void route_l2_ether(const struct routing_entry * const re, const enum protocol p
 			fprintf(stderr, "Don't know how to put %s inside Ethernet\n", protocol_info[proto].name);
 	}
 	
-	struct ifreq ifr;
-	strcpy(ifr.ifr_name, re->ifcfg->ifname);
-	if (ioctl(ps, SIOCGIFHWADDR, &ifr) == -1 || ifr.ifr_hwaddr.sa_family != ARPHRD_ETHER)
-	{
-		fprintf(stderr, "Error getting MAC address for '%s'\n", re->ifcfg->ifname);
-		return;
-	}
-	
 	nextproto = htons(nextproto);
 	
 	uint8_t fullpkt[14 + bufsz];
 	memcpy(&fullpkt[  0], re->xdata, 6);
-	memcpy(&fullpkt[  6], ifr.ifr_hwaddr.sa_data, 6);
+	if (!get_hwaddr(&fullpkt[6], 6, re->ifcfg, ARPHRD_ETHER))
+		return;
 	memcpy(&fullpkt[0xc], &nextproto, 2);
 	memcpy(&fullpkt[0xe], buf, bufsz);
 	
