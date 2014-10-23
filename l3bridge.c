@@ -170,7 +170,7 @@ enum l3p_nonether {
 static
 void l3_ipv6(struct pktinfo * const pi, const uint8_t * const buf)
 {
-	if (buf[2] == 0x3a)
+	if (buf[6] == 0x3a)
 	{
 		// ICMPv6
 		const uint8_t * const icmpv6 = &buf[40];
@@ -188,7 +188,7 @@ void l3_ipv6(struct pktinfo * const pi, const uint8_t * const buf)
 		}
 	}
 	
-	if (!buf[3])
+	if (!buf[7])
 	{
 		fprintf(stderr, "Discarding IPv6 packet reaching its hop limit\n");
 		return;
