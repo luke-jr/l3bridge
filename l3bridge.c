@@ -129,12 +129,15 @@ void set_routing_entry(const enum protocol redtype, const void * const red, stru
 	struct routing_entry *re = get_route_(redtype, red, fullred, &fullredsz);
 	if (re)
 	{
+		if (re->renhtype == renhtype && !memcmp(re->xdata, renh, renhsz))
+			// Same route
+			return;
+		
 		routing_entry_str(rstr, sizeof(rstr), re);
 		fprintf(stderr, "Replacing route %s\n", rstr);
+		HASH_DEL(routes, re);
 		if (protocol_info[re->renhtype].addrsz < renhsz)
 		{
-			// Can't just realloc without HASH_DEL in case it's moved
-			HASH_DEL(routes, re);
 			free(re);
 			goto no_re;
 		}
@@ -144,7 +147,6 @@ void set_routing_entry(const enum protocol redtype, const void * const red, stru
 no_re: ;
 		const size_t totsz = sizeof(*re) + renhsz + fullredsz;
 		re = malloc(totsz);
-		HASH_ADD_KEYPTR(hh, routes, fullred, fullredsz, re);
 	}
 	
 	re->ifcfg = ifcfg;
@@ -156,6 +158,7 @@ no_re: ;
 	
 	routing_entry_str(rstr, sizeof(rstr), re);
 	fprintf(stderr, "Adding    route %s\n", rstr);
+	HASH_ADD_KEYPTR(hh, routes, &re->xdata[renhsz], fullredsz, re);
 }
 
 struct pktinfo {
