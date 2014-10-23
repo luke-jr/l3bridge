@@ -27,6 +27,7 @@ struct if_cfg {
 };
 
 enum protocol {
+	LBP_NONE,
 	LBP_ETHERNET,
 	LBP_IPV4,
 	LBP_IPV6,
@@ -36,6 +37,7 @@ struct protocol_info {
 	const char *name;
 	int addrsz;
 } protocol_info[] = {
+	{ "(none)"  ,    0, },
 	{ "Ethernet",    6, },
 	{ "IPv4"    ,    4, },
 	{ "IPv6"    , 0x10, },
@@ -161,11 +163,23 @@ struct pktinfo {
 	size_t bufsz;
 	struct sockaddr_ll *from;
 	struct if_cfg *ifcfg;
+	enum protocol l2_proto;
+	const void *l2_srcaddr;
 };
 
 enum l3p_nonether {
 	L3P_STP = 0x10000,
 };
+
+static
+void this_layer_address(struct pktinfo * const pi, enum protocol proto, const void * const srcaddr, const void * const dstaddr)
+{
+	if (pi->l2_proto != LBP_NONE)
+		return;
+	
+	pi->l2_proto = proto;
+	pi->l2_srcaddr = srcaddr;
+}
 
 static
 void l3_ipv6(struct pktinfo * const pi, const uint8_t * const buf)
@@ -179,11 +193,17 @@ void l3_ipv6(struct pktinfo * const pi, const uint8_t * const buf)
 			case 136:  // Neighbor Advertisement
 			{
 				const uint8_t * const v6addr = &icmpv6[8];
-				if (icmpv6[0x18] == 2 && icmpv6[0x19] == 1 && pi->from->sll_hatype == ARPHRD_ETHER)
+#if 0
+				const size_t bufsz = pi->bufsz - (buf - pi->buf);
+				// TODO: properly implement the option
+				if (bufsz >= 0x18 && icmpv6[0x18] == 2 && icmpv6[0x19] == 1 && pi->from->sll_hatype == ARPHRD_ETHER)
 				{
 					const uint8_t * const macaddr = &icmpv6[0x1a];
 					set_routing_entry(LBP_IPV6, v6addr, pi->ifcfg, LBP_ETHERNET, macaddr);
 				}
+#endif
+				if (pi->l2_proto != LBP_NONE)
+					set_routing_entry(LBP_IPV6, v6addr, pi->ifcfg, LBP_ETHERNET, pi->l2_srcaddr);
 			}
 		}
 	}
@@ -235,6 +255,7 @@ void l2_ether(struct pktinfo * const pi, const uint8_t * const buf)
 		l3p = L3P_STP;
 	else
 		l3p = upk_u16be(buf, 0xc);
+	this_layer_address(pi, LBP_ETHERNET, &buf[6], &buf[0]);
 	l3(pi, l3p, &buf[0xe]);
 }
 
@@ -277,6 +298,7 @@ int main(int argc, char **argv)
 		safrom.sll_protocol = ntohs(safrom.sll_protocol);
 		pi.bufsz = r;
 		pi.ifcfg = ifcfg_from_ifindex(safrom.sll_ifindex);
+		pi.l2_proto = LBP_NONE;
 // 		fprintf(stderr, "protocol=%04x if=%s(%d) hatype=%u pkttype=%u halen=%u len=%lu\n", safrom.sll_protocol, pi.ifcfg->ifname, safrom.sll_ifindex, safrom.sll_hatype, safrom.sll_pkttype, safrom.sll_halen, (unsigned long)r);
 		if (!pi.ifcfg->enabled)
 			continue;
