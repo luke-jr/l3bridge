@@ -26,23 +26,29 @@ struct if_cfg {
 	UT_hash_handle hh;
 };
 
-enum routing_entry_dest_type {
-	RED_IPV4,
-	RED_IPV6,
+enum protocol {
+	LBP_ETHERNET,
+	LBP_IPV4,
+	LBP_IPV6,
 };
 
-enum routing_entry_nexthop_type {
-	RENH_ETHER,
+struct protocol_info {
+	const char *name;
+	int addrsz;
+} protocol_info[] = {
+	{ "Ethernet",    6, },
+	{ "IPv4"    ,    4, },
+	{ "IPv6"    , 0x10, },
 };
 
 struct routing_entry {
 	UT_hash_handle hh;
 	
 	struct if_cfg *ifcfg;
-	enum routing_entry_nexthop_type renhtype;
+	enum protocol renhtype;
 	uint8_t xdata[];
 	// variant renh
-	// enum routing_entry_dest_type redtype;
+	// enum protocol redtype;
 	// variant red
 };
 
@@ -67,30 +73,9 @@ struct if_cfg *ifcfg_from_ifindex(const unsigned int ifindex)
 static const size_t redsz_max = 0x10;
 
 static
-size_t redtype_sz(const enum routing_entry_dest_type redtype)
+struct routing_entry *get_route_(const enum protocol redtype, const void * const red, uint8_t * const fullred, size_t * const fullredsz)
 {
-	switch (redtype)
-	{
-		case RED_IPV4: return 4;
-		case RED_IPV6: return 0x10;
-	}
-	abort();
-}
-
-static
-size_t renhtype_sz(const enum routing_entry_nexthop_type renhtype)
-{
-	switch (renhtype)
-	{
-		case RENH_ETHER: return 6;
-	}
-	abort();
-}
-
-static
-struct routing_entry *get_route_(const enum routing_entry_dest_type redtype, const void * const red, uint8_t * const fullred, size_t * const fullredsz)
-{
-	const size_t redsz = redtype_sz(redtype);
+	const size_t redsz = protocol_info[redtype].addrsz;
 	*fullredsz = sizeof(redtype) + redsz;
 	memcpy(fullred, &redtype, sizeof(redtype));
 	memcpy(&fullred[sizeof(redtype)], red, redsz);
@@ -100,7 +85,7 @@ struct routing_entry *get_route_(const enum routing_entry_dest_type redtype, con
 }
 
 static
-struct routing_entry *get_route(const enum routing_entry_dest_type redtype, const void * const red)
+struct routing_entry *get_route(const enum protocol redtype, const void * const red)
 {
 	uint8_t fullred[redsz_max];
 	size_t fullredsz;
@@ -108,14 +93,14 @@ struct routing_entry *get_route(const enum routing_entry_dest_type redtype, cons
 }
 
 static
-void set_routing_entry(const enum routing_entry_dest_type redtype, const void * const red, struct if_cfg * const ifcfg, const enum routing_entry_nexthop_type renhtype, const void * const renh)
+void set_routing_entry(const enum protocol redtype, const void * const red, struct if_cfg * const ifcfg, const enum protocol renhtype, const void * const renh)
 {
 	uint8_t fullred[redsz_max];
 	size_t fullredsz;
-	const size_t renhsz = renhtype_sz(renhtype);
+	const size_t renhsz = protocol_info[renhtype].addrsz;
 	
 	struct routing_entry *re = get_route_(redtype, red, fullred, &fullredsz);
-	if ((!re) || renhtype_sz(re->renhtype) < renhsz)
+	if ((!re) || protocol_info[re->renhtype].addrsz < renhsz)
 	{
 		if (re)
 		{
@@ -162,7 +147,7 @@ void l3_ipv6(struct pktinfo * const pi, const uint8_t * const buf)
 				if (icmpv6[0x18] == 2 && icmpv6[0x19] == 1 && pi->from->sll_hatype == ARPHRD_ETHER)
 				{
 					const uint8_t * const macaddr = &icmpv6[0x1a];
-					set_routing_entry(RED_IPV6, v6addr, pi->ifcfg, RENH_ETHER, macaddr);
+					set_routing_entry(LBP_IPV6, v6addr, pi->ifcfg, LBP_ETHERNET, macaddr);
 				}
 			}
 		}
