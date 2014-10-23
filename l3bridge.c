@@ -93,21 +93,53 @@ struct routing_entry *get_route(const enum protocol redtype, const void * const 
 }
 
 static
+int protocol_dest_str(char * const s, const size_t sz, const enum protocol proto, const uint8_t * const addr)
+{
+	const size_t addrsz = protocol_info[proto].addrsz;
+	char hex[(addrsz * 2) + 1];
+	bin2hex(hex, addr, addrsz);
+	return snprintf(s, sz, "%s:%s", protocol_info[proto].name, hex);
+}
+
+static
+// "PROTO:HEX via PROTO:HEX dev IFNAME"
+int routing_entry_str(char *s, size_t sz, const struct routing_entry * const re)
+{
+	int rv = 0;
+	const size_t renhsz = protocol_info[re->renhtype].addrsz;
+	enum protocol redtype;
+	memcpy(&redtype, &re->xdata[renhsz], sizeof(redtype));
+	_SNP2(protocol_dest_str, redtype, &re->xdata[renhsz + sizeof(redtype)]);
+	_SNP(" via ");
+	_SNP2(protocol_dest_str, re->renhtype, re->xdata);
+	_SNP(" dev %s", re->ifcfg->ifname);
+	return rv;
+}
+
+static
 void set_routing_entry(const enum protocol redtype, const void * const red, struct if_cfg * const ifcfg, const enum protocol renhtype, const void * const renh)
 {
 	uint8_t fullred[redsz_max];
 	size_t fullredsz;
+	char rstr[0x100];
 	const size_t renhsz = protocol_info[renhtype].addrsz;
 	
 	struct routing_entry *re = get_route_(redtype, red, fullred, &fullredsz);
-	if ((!re) || protocol_info[re->renhtype].addrsz < renhsz)
+	if (re)
 	{
-		if (re)
+		routing_entry_str(rstr, sizeof(rstr), re);
+		fprintf(stderr, "Replacing route %s\n", rstr);
+		if (protocol_info[re->renhtype].addrsz < renhsz)
 		{
 			// Can't just realloc without HASH_DEL in case it's moved
 			HASH_DEL(routes, re);
 			free(re);
+			goto no_re;
 		}
+	}
+	else
+	{
+no_re: ;
 		const size_t totsz = sizeof(*re) + renhsz + fullredsz;
 		re = malloc(totsz);
 		HASH_ADD_KEYPTR(hh, routes, fullred, fullredsz, re);
@@ -119,6 +151,9 @@ void set_routing_entry(const enum protocol redtype, const void * const red, stru
 	
 	// NOTE: In theory, we can skip this for cases where renhsz is a perfect match for the old renh size, but NOT if the new size is smaller!
 	memcpy(&re->xdata[renhsz], fullred, fullredsz);
+	
+	routing_entry_str(rstr, sizeof(rstr), re);
+	fprintf(stderr, "Adding    route %s\n", rstr);
 }
 
 struct pktinfo {

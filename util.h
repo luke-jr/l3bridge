@@ -152,4 +152,15 @@ void pk_u64le(void * const bufp, const int offset, const uint64_t nv)
 	buf[offset+7] = (nv >> 0x38) & 0xff;
 }
 
+extern void bin2hex(char *, const void *, size_t);
+
+#define _SNP2(fn, ...)  do{  \
+        int __n42 = fn(s, sz, __VA_ARGS__);  \
+        s += __n42;  \
+        sz = (sz <= __n42) ? 0 : (sz - __n42);  \
+        rv += __n42;  \
+}while(0)
+
+#define _SNP(...)  _SNP2(snprintf, __VA_ARGS__)
+
 #endif
