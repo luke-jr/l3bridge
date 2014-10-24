@@ -1,8 +1,14 @@
 #include <assert.h>
+#include <errno.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <unistd.h>
+
+#include <asm/types.h>
+#include <linux/netlink.h>
+#include <linux/rtnetlink.h>
 
 #include <arpa/inet.h>
 #include <sys/ioctl.h>
@@ -197,7 +203,120 @@ bool get_hwaddr(void * const buf, const size_t bufsz, const struct if_cfg * cons
 }
 
 static
-void route_l2_ether(const struct routing_entry * const re, const enum protocol proto, const uint8_t * const buf, const size_t bufsz)
+bool get_linkaddr(void * const out, const struct if_cfg * const ifcfg, const int domain, const int addrsz)
+{
+	const int nls = socket(AF_NETLINK, SOCK_DGRAM, NETLINK_ROUTE);
+	if (nls < 0)
+	{
+		fprintf(stderr, "Can't open netlink\n");
+		return false;
+	}
+	
+	const int ifindex = if_nametoindex(ifcfg->ifname);
+	if (!ifindex)
+		return false;
+	
+	struct {
+		struct nlmsghdr hdr;
+		struct ifaddrmsg msg;
+		struct rtattr rt __attribute__ ((aligned(NLMSG_ALIGNTO)));
+		uint8_t data[0x10];
+	} req = {
+		.hdr = {
+			.nlmsg_len = NLMSG_LENGTH(sizeof(req.msg)),
+			.nlmsg_flags = NLM_F_REQUEST | NLM_F_ROOT,
+			.nlmsg_type = RTM_GETADDR,
+		},
+		.msg = {
+			.ifa_family = domain,
+			.ifa_index = ifindex,
+		},
+		.rt = {
+			.rta_len = RTA_LENGTH(addrsz),
+		},
+	};
+	if (addrsz > sizeof(req.data))
+	{
+		fprintf(stderr, "addrsz(%d) > sizeof(req.data)\n", addrsz);
+		return false;
+	}
+	
+	if (send(nls, &req, req.hdr.nlmsg_len, 0) < 0)
+	{
+err:
+		fprintf(stderr, "Error in netlink communication\n");
+		close(nls);
+		return false;
+	}
+	
+	char buf[0x4000];
+	struct iovec iov = {
+		.iov_base = buf,
+	};
+	struct sockaddr_nl nladdr;
+	struct msghdr msg = {
+		.msg_name = &nladdr,
+		.msg_namelen = sizeof(nladdr),
+		.msg_iov = &iov,
+		.msg_iovlen = 1,
+	};
+	bool found = false;
+	bool done = false;
+	while (!done)
+	{
+		iov.iov_len = sizeof(buf);
+		int status = recvmsg(nls, &msg, 0);
+		if (status <= 0)
+		{
+			if (errno == EINTR || errno == EAGAIN)
+				continue;
+			goto err;
+		}
+		
+		for (struct nlmsghdr *hdr = (void*)buf; NLMSG_OK(hdr, status); hdr = NLMSG_NEXT(hdr, status))
+		{
+			if (hdr->nlmsg_type == NLMSG_DONE)
+				done = true;
+			if (hdr->nlmsg_type != 0x14 /* FIXME */)
+				continue;
+			
+			struct ifaddrmsg * const msg = (void*)NLMSG_DATA(hdr);
+			if (msg->ifa_family != domain || msg->ifa_index != ifindex)
+				continue;
+			int rtsz = IFA_PAYLOAD(hdr);
+			
+			for (struct rtattr *rt = (void*)IFA_RTA(msg); RTA_OK(rt, rtsz); rt = RTA_NEXT(rt, rtsz))
+			{
+				if (rt->rta_type != IFA_ADDRESS)
+					continue;
+				
+				if (found)
+				{
+					// Check if we already have our idea address
+					switch (domain)
+					{
+						case AF_INET6:
+							if (upk_u16be(out, 0) == 0xfe80)
+								goto skiprt;
+							break;
+						default:
+							break;
+					}
+				}
+				
+				found = true;
+				memcpy(out, RTA_DATA(rt), addrsz);
+				
+skiprt: ;
+			}
+		}
+	}
+	close(nls);
+	return found;
+}
+
+static
+bool route_l2_ether(const struct routing_entry * const re, const enum protocol proto, const uint8_t * const buf, const size_t bufsz)
 {
 	uint16_t nextproto;
 	switch (proto)
@@ -207,6 +326,7 @@ void route_l2_ether(const struct routing_entry * const re, const enum protocol p
 			break;
 		default:
 			fprintf(stderr, "Don't know how to put %s inside Ethernet\n", protocol_info[proto].name);
+			return false;
 	}
 	
 	nextproto = htons(nextproto);
@@ -214,7 +334,7 @@ void route_l2_ether(const struct routing_entry * const re, const enum protocol p
 	uint8_t fullpkt[14 + bufsz];
 	memcpy(&fullpkt[  0], re->xdata, 6);
 	if (!get_hwaddr(&fullpkt[6], 6, re->ifcfg, ARPHRD_ETHER))
-		return;
+		return false;
 	memcpy(&fullpkt[0xc], &nextproto, 2);
 	memcpy(&fullpkt[0xe], buf, bufsz);
 	
@@ -224,13 +344,108 @@ void route_l2_ether(const struct routing_entry * const re, const enum protocol p
 	if (!sa.sll_ifindex)
 	{
 		fprintf(stderr, "Error finding outgoing interface '%s'\n", re->ifcfg->ifname);
-		return;
+		return false;
 	}
 	sa.sll_halen = 6;
 	memcpy(sa.sll_addr, re->xdata, 6);
 	
 	if (sendto(ps, fullpkt, sizeof(fullpkt), 0, (void*)&sa, sizeof(sa)) != sizeof(fullpkt))
+	{
 		fprintf(stderr, "Error sending packet on '%s'\n", re->ifcfg->ifname);
+		return false;
+	}
+	
+	return true;
+}
+
+static
+void icmpv6_checksum(void * const buf, const size_t sz)
+{
+	unsigned i;
+	uint8_t *p = buf;
+	uint32_t sum = 0;
+	
+	// Addresses
+	for (i = 8; i < 40; i += 2)
+		sum += upk_u16le(p, i);
+	// ICMPv6 length
+	sum += upk_u16le(p, 4);
+	// Next header
+	sum += (uint16_t)p[6] << 8;
+	// ICMPv6 data
+	sum += upk_u16le(p, 40);
+	for (i = 44; i < sz; i += 2)
+		sum += upk_u16le(p, i);
+	
+	sum += sum >> 0x10;
+	sum = 0xffff & ~sum;
+	
+	pk_u16le(buf, 0x2a, sum);
+}
+
+static
+void solicit_route_ipv6(const void * const destaddr)
+{
+	uint8_t ipv6pkt[0x48] = {
+		0x60, 0, 0, 0, 0, 0x20, 0x3a, 0xff,
+		0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,  // source addr
+		0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,  // dest addr
+		// ICMPv6
+		135,  // Neighbor Solicitation
+		0,
+		0,0,  // checksum
+		0,0,0,0,
+		0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,  // dest addr
+		// ICMPv6 option
+		1,  // type: source link-layer address
+		1,  // length: 1-8 bytes
+		0,0,0,0,0,0,  // link-layer address
+	};
+	struct {
+		struct routing_entry re;
+		uint8_t buf[6];
+	} my_re = {
+		.re = {
+			.renhtype = LBP_ETHERNET,
+		},
+	};
+	struct if_cfg *ifcfg, *ifcfgtmp;
+	HASH_ITER(hh, cfgs, ifcfg, ifcfgtmp)
+	{
+		if (!get_hwaddr(&ipv6pkt[0x42], 6, ifcfg, ARPHRD_ETHER))
+			continue;
+		if (!get_linkaddr(&ipv6pkt[8], ifcfg, AF_INET6, 0x10))
+			continue;
+		memcpy(&ipv6pkt[0x18], destaddr, 0x10);
+		memcpy(&ipv6pkt[0x30], destaddr, 0x10);
+		icmpv6_checksum(ipv6pkt, sizeof(ipv6pkt));
+		
+		my_re.re.ifcfg = ifcfg;
+		memset(my_re.buf, '\xff', 6);
+		if (route_l2_ether(&my_re.re, LBP_IPV6, ipv6pkt, sizeof(ipv6pkt)))
+		{
+			char s[0x100];
+			protocol_dest_str(s, sizeof(s), LBP_IPV6, destaddr);
+			fprintf(stderr, "Solicited route for %s\n", s);
+		}
+	}
+}
+
+static
+void solicit_route(const enum protocol proto, const void * const destaddr)
+{
+	switch (proto)
+	{
+		case LBP_IPV6:
+			solicit_route_ipv6(destaddr);
+			break;
+		default:
+		{
+			char s[0x100];
+			protocol_dest_str(s, sizeof(s), proto, destaddr);
+			fprintf(stderr, "Don't know how to solicit route for %s\n", s);
+		}
+	}
 }
 
 static
@@ -242,6 +457,7 @@ void route_out(const enum protocol proto, const void * const destaddr, const uin
 		char s[0x100];
 		protocol_dest_str(s, sizeof(s), proto, destaddr);
 		fprintf(stderr, "Failed to get route for %s\n", s);
+		solicit_route(proto, destaddr);
 		return;
 	}
 	
