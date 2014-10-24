@@ -1,0 +1,7 @@
+*~
+a.out
+l3bridge
+*.orig
+*.rej
+*.o
+core*
